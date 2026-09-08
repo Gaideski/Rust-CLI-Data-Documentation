@@ -1,0 +1,14 @@
+[package]
+name = "cli_data_doc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rand = "0.10.2"
+serde = { version = "1.0.229", features = ["derive"] }
+yaml_serde = "0.10.7"
+sqlparser = "0.62.0"
+bincode = "1.3.3"
+
+[dev-dependencies]
+tempfile = "3"
