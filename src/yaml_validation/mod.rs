@@ -1,55 +1,61 @@
 use crate::doc_persistence::save_all;
-use crate::service_response::{acceptable::AcceptableResponse, failures::FailureResponse};
+use crate::service_response::failures::FailureResponse;
+use crate::service_response::validation_report::ValidationReport;
 use crate::table_yaml_definition::TableDoc;
 use std::fs::read_to_string;
 use std::path::PathBuf;
 
 pub fn validate_yml_files(
     yaml_files: &[PathBuf],
-) -> Result<AcceptableResponse, Vec<FailureResponse>> {
+) -> Result<ValidationReport, Vec<FailureResponse>> {
     let mut docs = Vec::new();
     let mut errors = Vec::new();
 
     for path in yaml_files {
         match validate_single_file(path) {
             Ok(doc) => docs.push(doc),
-            Err(e) => errors.extend(e),
+            Err(e) => errors.push(e),
         }
     }
 
     if !errors.is_empty() {
         return Err(errors);
     }
+    persist_docs(&docs).map_err(|e| vec![e])?;
 
-    save_all(&docs).map_err(|e| {
-        vec![FailureResponse::IoError {
-            error: e.to_string(),
-            path: "unknown_path".to_string(),
-        }]
-    })?;
-
-    Ok(AcceptableResponse::Ok)
+    Ok(ValidationReport {
+        tables_onboarded: docs.len(),
+        files_processed: yaml_files.len(),
+    })
 }
 
-fn validate_single_file(path: &PathBuf) -> Result<TableDoc, Vec<FailureResponse>> {
-    let content = read_file(path).map_err(|e| vec![e])?;
-    let table_doc = yaml_serde::from_str::<TableDoc>(&content).map_err(|e| {
-        vec![FailureResponse::MissingField(format!(
+fn persist_docs(docs: &[TableDoc]) -> Result<(), FailureResponse> {
+    Ok(save_all(&docs).map_err(|e| FailureResponse::IoError {
+        error: e.to_string(),
+        path: "unknown_path".to_string(),
+    }))?
+}
+
+fn validate_single_file(path: &PathBuf) -> Result<TableDoc, FailureResponse> {
+    let content = read_file(path)?;
+    match yaml_serde::from_str::<TableDoc>(&content) {
+        Ok(table_doc) => match table_doc.validate() {
+            Ok(_) => Ok(table_doc),
+            Err(e) => Err({
+                FailureResponse::Malformed(e.iter().fold(String::new(), |s1, s2| s1 + ", " + s2))
+            }),
+        },
+        Err(e) => Err(FailureResponse::MissingField(format!(
             "File: {}, failed at {e}.",
             path.display()
-        ))]
-    })?;
-
-    match table_doc.validate() {
-        Ok(_) => Ok(table_doc),
-        Err(e) => Err(e.into_iter().map(FailureResponse::Malformed).collect()),
+        ))),
     }
 }
 
 fn read_file(file_path: &PathBuf) -> Result<String, FailureResponse> {
     match read_to_string(file_path) {
         Ok(c) => Ok(c),
-        Err(e) => Err(FailureResponse::Other {
+        Err(e) => Err(FailureResponse::IoError {
             path: file_path.display().to_string(),
             error: e.to_string(),
         }),
@@ -58,7 +64,7 @@ fn read_file(file_path: &PathBuf) -> Result<String, FailureResponse> {
 
 #[cfg(test)]
 mod test {
-    use crate::service_response::acceptable::AcceptableResponse;
+    use crate::service_response::validation_report::ValidationReport;
     use crate::yaml_validation::{read_file, validate_yml_files};
     use std::env;
     use std::fs::{create_dir_all, remove_dir_all, write};
@@ -117,7 +123,7 @@ mod test {
         let file_path =
             create_file_with_content(&dir, VALID_YAML).expect("Failed to create valid test file");
         assert_eq!(
-            AcceptableResponse::Ok,
+            ValidationReport::new(),
             validate_yml_files(&vec![file_path]).unwrap()
         );
         remove_dir_all(&dir).expect("Failed to remove test data at temp dir");

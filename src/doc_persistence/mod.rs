@@ -4,15 +4,17 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::{env, fs};
 
 /// Sanity cap to prevent bincode from trying to allocate petabytes
 /// if the file is corrupted or tampered with.
 const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024;
-static TABLE_CACHE: OnceLock<Result<HashMap<String, TableDoc>, FailureResponse>> = OnceLock::new();
-static COLUMN_CACHE: OnceLock<Result<HashMap<&String, &ColumnDoc>, FailureResponse>> = OnceLock::new();
+static TABLE_CACHE: OnceLock<Result<Arc<HashMap<String, TableDoc>>, FailureResponse>> =
+    OnceLock::new();
 
+static COLUMN_CACHE: OnceLock<Result<Arc<HashMap<String, Arc<ColumnDoc>>>, FailureResponse>> =
+    OnceLock::new();
 
 fn data_dir() -> PathBuf {
     env::var("WORKSPACE")
@@ -21,39 +23,41 @@ fn data_dir() -> PathBuf {
         .join("data")
 }
 
-pub fn table_cache() -> Result<&'static HashMap<String, TableDoc>, &'static FailureResponse> {
+pub fn table_cache() -> Result<Arc<HashMap<String, TableDoc>>, FailureResponse> {
     TABLE_CACHE
         .get_or_init(|| {
-            load_all().map_err(|e| FailureResponse::Other {
+            load_all().map_err(|e| FailureResponse::IoError {
                 error: e.to_string(),
                 path: data_dir().display().to_string(),
             })
         })
-        .as_ref()
+        .clone()
 }
 
-pub fn column_cache() -> Result<&'static HashMap<&'static String, &'static ColumnDoc>, &'static FailureResponse> {
+pub fn column_cache() -> Result<Arc<HashMap<String, Arc<ColumnDoc>>>, FailureResponse> {
     COLUMN_CACHE
         .get_or_init(|| match table_cache() {
-            Ok(tables) => Ok(tables
-                .values()
-                .flat_map(|table| table.columns.iter())
-                .map(|col| (&col.name, col))
-                .collect()),
-            Err(e) => Err(FailureResponse::Other {
+            Ok(tables) => {
+                let map = tables
+                    .values()
+                    .flat_map(|table| table.columns.iter())
+                    .map(|col| (col.name.clone(), Arc::new(col.clone())))
+                    .collect();
+                Ok(Arc::new(map))
+            }
+            Err(e) => Err(FailureResponse::IoError {
                 error: e.to_string(),
                 path: data_dir().display().to_string(),
             }),
         })
-        .as_ref()
+        .clone()
 }
-
 
 pub fn save_all(docs: &[TableDoc]) -> bincode::Result<()> {
     save_all_to_path(docs, data_dir())
 }
 
-pub fn load_all() -> bincode::Result<HashMap<String, TableDoc>> {
+pub fn load_all() -> bincode::Result<Arc<HashMap<String, TableDoc>>> {
     load_all_from_path(data_dir())
 }
 
@@ -67,7 +71,7 @@ fn save_all_to_path(docs: &[TableDoc], path: impl AsRef<Path>) -> bincode::Resul
     bincode::serialize_into(writer, &data)
 }
 
-fn load_all_from_path(path: impl AsRef<Path>) -> bincode::Result<HashMap<String, TableDoc>> {
+fn load_all_from_path(path: impl AsRef<Path>) -> bincode::Result<Arc<HashMap<String, TableDoc>>> {
     let path = path.as_ref();
     if !path.exists() {
         return Err(Box::new(bincode::ErrorKind::Io(std::io::Error::new(
@@ -85,8 +89,10 @@ fn load_all_from_path(path: impl AsRef<Path>) -> bincode::Result<HashMap<String,
     }
     let file = File::open(path)?;
     let reader = BufReader::new(file);
-    bincode::deserialize_from(reader)
+    let map: HashMap<String, TableDoc> = bincode::deserialize_from(reader)?;
+    Ok(Arc::new(map))
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,7 +112,7 @@ mod tests {
         ColumnDoc {
             name: name.to_string(),
             r#type: ty.to_string(),
-            constraints: constraints.iter().map(|s| Some(s.to_string())).collect(),
+            constraints: constraints.iter().map(|s| s.to_string()).collect(),
             description: format!("{name} desc"),
             use_case: format!("{name} use"),
         }
@@ -231,7 +237,7 @@ mod tests {
             vec![ColumnDoc {
                 name: "price".to_string(),
                 r#type: "DECIMAL(10,2)".to_string(),
-                constraints: Some(vec!["NOT NULL".into(), "CHECK (price > 0)".into()]),
+                constraints: (vec!["NOT NULL".into(), "CHECK (price > 0)".into()]),
                 description: "Product price".to_string(),
                 use_case: "Pricing".to_string(),
             }],
@@ -243,10 +249,7 @@ mod tests {
         let c = &loaded["products"].columns[0];
         assert_eq!(c.name, "price");
         assert_eq!(c.r#type, "DECIMAL(10,2)");
-        assert_eq!(
-            c.constraints,
-            Some(vec!["NOT NULL".into(), "CHECK (price > 0)".into()])
-        );
+        assert_eq!(c.constraints, (vec!["NOT NULL", "CHECK (price > 0)"]));
         assert_eq!(c.description, "Product price");
         assert_eq!(c.use_case, "Pricing");
     }

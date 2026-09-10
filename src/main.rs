@@ -3,15 +3,30 @@ pub mod doc_validation;
 pub mod service_response;
 pub mod table_yaml_definition;
 pub mod yaml_validation;
+pub mod service_mode;
 
 use crate::doc_validation::validate;
 use crate::service_mode::MODE;
 use crate::service_response::failures::FailureResponse;
+use crate::service_response::validation_report::ValidationReport;
+use clap::Parser;
 use std::path::PathBuf;
 use std::{fs, path::Path};
 use yaml_validation::validate_yml_files;
 
-fn main() -> Result<(), Vec<FailureResponse>> {
+#[derive(Parser, Debug)]
+#[command(name = "cli-data-doc", version, about)]
+struct Args {
+    #[arg(default_value = ".", help = "Document repository")]
+    repo: PathBuf,
+    #[arg(short, long, value_enum, default_value_t = MODE::VALIDATION)]
+    mode: MODE,
+    #[arg(long, default_value = ".", help = "Workspace root for persisted data")]
+    workspace: PathBuf,
+}
+
+fn main() -> Result<ValidationReport, Vec<FailureResponse>> {
+    let args = Args::parse();
     let hard_path = r"C:\Users\BRUNOH~1\AppData\Local\Temp\rust_test_data".to_string();
 
     //let repo_dir = env::args_os().nth(1).unwrap_or_else(|| ".".into());
@@ -19,21 +34,21 @@ fn main() -> Result<(), Vec<FailureResponse>> {
     let mode = MODE::VALIDATION;
 
     match mode {
-        MODE::DOCUMENTATION => validate_and_onboard_documentation(&path),
-        MODE::VALIDATION => validate_existing_query(&path),
+        MODE::DOCUMENTATION => run_documentation(&args.repo),
+        MODE::VALIDATION => run_validation(&args.repo),
     }
 }
 
-fn validate_and_onboard_documentation(path: &Path) -> Result<(), Vec<FailureResponse>> {
+fn run_documentation(path: &Path) -> Result<ValidationReport, Vec<FailureResponse>> {
     println!("Starting repo scanning at directory: {}", path.display());
 
     let available_files = scan_for_file_extension(path, is_yaml)?;
     println!("Found {} YAML file(s).", available_files.len());
 
     match validate_yml_files(&available_files) {
-        Ok(_) => {
+        Ok(report) => {
             println!("Documentation approved");
-            Ok(())
+            Ok(report)
         }
         Err(errors) => {
             print!("The following failures were found:");
@@ -41,23 +56,23 @@ fn validate_and_onboard_documentation(path: &Path) -> Result<(), Vec<FailureResp
                 "{}",
                 errors
                     .iter()
-                    .fold(String::new(), |s1, s2| s1.trim_start().to_owned()
-                        + "/n"
-                        + s2.to_string().as_ref())
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n")
             );
             Err(errors)
         }
     }
 }
 
-fn validate_existing_query(path: &Path) -> Result<(), Vec<FailureResponse>> {
+fn run_validation(path: &Path) -> Result<ValidationReport, Vec<FailureResponse>> {
     println!("Starting repo scanning at directory: {}", path.display());
     let available_files = scan_for_file_extension(path, is_sql)?;
     println!("Found {} SQL file(s).", available_files.len());
     match validate(&available_files) {
-        Ok(_) => {
+        Ok(report) => {
             println!("SQL files approved");
-            Ok(())
+            Ok(report)
         }
         Err(errors) => {
             print!("The following failures were found:");
@@ -65,18 +80,18 @@ fn validate_existing_query(path: &Path) -> Result<(), Vec<FailureResponse>> {
                 "{}",
                 errors
                     .iter()
-                    .fold(String::new(), |s1, s2| s1.trim_start().to_owned()
-                        + "/n"
-                        + s2.to_string().as_ref())
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n")
             );
             Err(errors)
         }
     }
 }
-fn scan_for_file_extension(
-    path: &Path,
-    filter: fn(&Path) -> bool,
-) -> Result<Vec<PathBuf>, Vec<FailureResponse>> {
+fn scan_for_file_extension<F>(path: &Path, filter: F) -> Result<Vec<PathBuf>, Vec<FailureResponse>>
+where
+    F: Fn(&Path) -> bool,
+{
     if !path.is_dir() {
         return Err(vec![FailureResponse::InvalidPath(format!(
             "The directory: {} is not valid!",
@@ -91,7 +106,7 @@ fn scan_for_file_extension(
         let entry = entry.map_err(|e| vec![io_failure(path, &e)])?;
         let entry_path = entry.path();
         if entry_path.is_dir() {
-            yaml_files.extend(scan_for_file_extension(&entry_path, filter)?);
+            yaml_files.extend(scan_for_file_extension(&entry_path, &filter)?);
         } else if filter(&entry_path) {
             yaml_files.push(entry_path);
         }
@@ -124,10 +139,11 @@ fn io_failure(path_buf: &Path, e: &std::io::Error) -> FailureResponse {
 mod tests {
     use super::*;
     use fs::{create_dir_all, remove_dir_all, write};
-    use rand::{RngExt, random};
     use std::env;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use rand::RngExt;
+    use tempfile::TempDir;
 
     #[test]
     fn test_is_yaml() {
@@ -144,19 +160,18 @@ mod tests {
 
     #[test]
     fn test_scan_and_print_paths_successful_detection() {
-        let unique_folder = format!("cli-validation-test-{}", random::<u32>());
-        let test_dir = env::temp_dir().join(unique_folder);
+        let test_dir = TempDir::new().unwrap();
 
         let expected_yaml_count =
-            generate_random_dir_struct(&test_dir).expect("Failed to setup test dir");
-        let found_files = scan_for_file_extension(&test_dir, is_yaml).expect("Scan failed");
+            generate_random_dir_struct(&test_dir.path()).expect("Failed to setup test dir");
+        let found_files = scan_for_file_extension(&test_dir.path(), is_yaml).expect("Scan failed");
         assert_eq!(expected_yaml_count, found_files.len());
 
         // Clean up ONLY the test directory created for this run
         let _ = remove_dir_all(&test_dir);
     }
 
-    fn generate_random_dir_struct(temp_dir: &PathBuf) -> Result<usize, Box<dyn std::error::Error>> {
+    fn generate_random_dir_struct(temp_dir: &Path) -> Result<usize, Box<dyn std::error::Error>> {
         let file_extensions = vec![".txt", ".yml", ".yaml", ".jpg", ".json", ".png"];
         let mut rng = rand::rng();
 
@@ -175,6 +190,7 @@ mod tests {
                 file_dir.push(format!("{}_{}", index, timestamp));
                 create_dir_all(&file_dir)?;
             }
+
             let sorted_ext = file_extensions[rng.random_range(0..file_extensions.len())];
             file_dir.push(format!("file{}_{}", timestamp, sorted_ext));
             write(&file_dir, "PLACEHOLDER")?;
@@ -188,9 +204,3 @@ mod tests {
     }
 }
 
-mod service_mode {
-    pub enum MODE {
-        DOCUMENTATION,
-        VALIDATION,
-    }
-}

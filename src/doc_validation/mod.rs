@@ -1,70 +1,87 @@
 use crate::doc_persistence::{column_cache, table_cache};
-use crate::service_response::{acceptable::AcceptableResponse, failures::FailureResponse};
+use crate::service_response::failures::FailureResponse;
+use crate::service_response::validation_report::ValidationReport;
 use crate::table_yaml_definition::{ColumnDoc, ColumnInfo, TableDoc, TableInfo};
 use sqlparser::ast::{CreateTable, ObjectNamePart, Statement};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 const DIALECT: GenericDialect = GenericDialect {};
 
-pub fn validate(files: &[PathBuf]) -> Result<AcceptableResponse, Vec<FailureResponse>> {
-    let errors: Vec<FailureResponse> = files
-        .into_iter()
-        .filter_map(|path| validate_file(path).err())
-        .flatten()
-        .collect();
+pub fn validate(files: &[PathBuf]) -> Result<ValidationReport, Vec<FailureResponse>> {
+    let mut errors: Vec<FailureResponse> = Vec::new();
+    let mut validation_report: ValidationReport = ValidationReport::new();
+
+    for file in files {
+        match validate_file(file) {
+            Ok(report) => {
+                validation_report.tables_onboarded += report.tables_onboarded;
+                validation_report.files_processed += report.files_processed;
+            }
+            Err(e) => {
+                errors.extend(e);
+            }
+        }
+    }
 
     if !errors.is_empty() {
         Err(errors)
     } else {
-        Ok(AcceptableResponse::Ok)
+        Ok(validation_report)
     }
 }
 
-fn validate_file(file: &PathBuf) -> Result<AcceptableResponse, Vec<FailureResponse>> {
+fn validate_file(file: &PathBuf) -> Result<ValidationReport, Vec<FailureResponse>> {
     let contents = fs::read_to_string(file).map_err(|e| {
         vec![FailureResponse::IoError {
             path: file.display().to_string(),
             error: e.to_string(),
         }]
     })?;
-    validate_single_file(&contents)
+    validate_single_file(&contents, file)
 }
 
-fn validate_single_file(query: &str) -> Result<AcceptableResponse, Vec<FailureResponse>> {
+fn validate_single_file(
+    query: &str,
+    filename: &PathBuf,
+) -> Result<ValidationReport, Vec<FailureResponse>> {
     let mut errors = Vec::new();
-
     let statements = match Parser::parse_sql(&DIALECT, query) {
         Ok(stms) => filter_create_table(stms),
         Err(e) => {
             errors.push(FailureResponse::ParseError {
-                contents: query.to_owned(),
+                path: filename.display().to_string(),
                 error: e.to_string(),
             });
             return Err(errors);
         }
     };
+    let create_table_single_file_count = statements.len();
 
     if let Err(mut info_errors) = extract_and_compare_info(&statements) {
         errors.append(&mut info_errors);
     }
 
     if errors.is_empty() {
-        Ok(AcceptableResponse::Ok)
+        Ok(ValidationReport {
+            files_processed: 1,
+            tables_onboarded: create_table_single_file_count,
+        })
     } else {
         Err(errors)
     }
 }
 
-fn extract_and_compare_info(
-    statements: &Vec<CreateTable>,
-) -> Result<AcceptableResponse, Vec<FailureResponse>> {
+fn extract_and_compare_info(statements: &Vec<CreateTable>) -> Result<(), Vec<FailureResponse>> {
     let mut errors: Vec<FailureResponse> = Vec::new();
     for stm in statements {
         let table = extract_table_info(&stm);
-        match verify_table_doc(&table) {
+        let cache = table_cache().map_err(|e| vec![e]);
+        match verify_table_doc(&table, cache?.as_ref()) {
             Ok(_) => {
                 let columns = extract_columns_info(&stm);
                 if let Err(mut e) = verify_columns_doc(&columns) {
@@ -75,34 +92,37 @@ fn extract_and_compare_info(
         }
     }
     if errors.is_empty() {
-        Ok(AcceptableResponse::Ok)
+        Ok(())
     } else {
         Err(errors)
     }
 }
 
-fn verify_table_doc(query_table: &TableInfo) -> Result<TableDoc, FailureResponse> {
-    if let Some(doc) = find_table_doc(query_table) {
+fn verify_table_doc(
+    query_table: &TableInfo,
+    cache: &HashMap<String, TableDoc>,
+) -> Result<TableDoc, FailureResponse> {
+    if let Ok(Some(doc)) = find_table_doc(query_table) {
         Ok(doc)
     } else {
         Err(FailureResponse::DocumentationNotOnboarded(format!(
             "Documentation not found for table: {}",
-            query_table.name
+            query_table.0
         )))
     }
 }
 
-fn verify_columns_doc(columns: &[ColumnInfo]) -> Result<AcceptableResponse, Vec<FailureResponse>> {
+fn verify_columns_doc(columns: &[ColumnInfo]) -> Result<(), Vec<FailureResponse>> {
     let mut errors = Vec::new();
     for column in columns {
-        if let Some(doc) = find_column_doc(&column) {
+        if let Ok(Some(doc)) = find_column_doc(&column) {
             if !column.is_doc_equals(&doc) {
                 errors.push(FailureResponse::FieldMismatch {
                     field_name: column.name.to_owned(),
                     field_type: column.r#type.to_owned(),
                     doc_type: doc.r#type.to_owned(),
-                    field_constraints: Vec::from(column.constraints.as_deref().unwrap_or_default()),
-                    doc_constraints: Vec::from(doc.constraints.as_deref().unwrap_or_default()),
+                    field_constraints: column.constraints.clone(),
+                    doc_constraints: doc.constraints.clone(),
                 })
             }
         } else {
@@ -110,30 +130,20 @@ fn verify_columns_doc(columns: &[ColumnInfo]) -> Result<AcceptableResponse, Vec<
         }
     }
     if errors.is_empty() {
-        Ok(AcceptableResponse::Ok)
+        Ok(())
     } else {
         Err(errors)
     }
 }
 
-fn find_table_doc(table: &TableInfo) -> Option<TableDoc> {
-    match table_cache() {
-        Ok(cache) => cache.get(&table.name).cloned(),
-        Err(e) => {
-            println!("Failed to acquire documentation: {}", e);
-            None
-        }
-    }
+fn find_table_doc(table: &TableInfo) -> Result<Option<TableDoc>, FailureResponse> {
+    let cache = table_cache()?;
+    Ok(cache.get(&table.0).cloned())
 }
 
-fn find_column_doc<'a>(column: &ColumnInfo) -> Option<&'a ColumnDoc> {
-    match column_cache() {
-        Ok(cache) => cache.get(&column.name).cloned(),
-        Err(e) => {
-            println!("Failed to acquire documentation: {}", e);
-            None
-        }
-    }
+fn find_column_doc(column: &ColumnInfo) -> Result<Option<Arc<ColumnDoc>>, FailureResponse> {
+    let cache = column_cache()?;
+    Ok(cache.get(&column.name).cloned())
 }
 
 fn filter_create_table(statements: Vec<Statement>) -> Vec<CreateTable> {
@@ -156,7 +166,7 @@ fn extract_table_info(table: &CreateTable) -> TableInfo {
             _ => None,
         })
         .unwrap_or_default();
-    TableInfo { name: table_name }
+    TableInfo(table_name)
 }
 
 fn extract_columns_info(table: &CreateTable) -> Vec<ColumnInfo> {
@@ -169,7 +179,7 @@ fn extract_columns_info(table: &CreateTable) -> Vec<ColumnInfo> {
             constraints: column
                 .options
                 .iter()
-                .map(|opt| Some(opt.option.to_string()))
+                .map(|opt| opt.option.to_string())
                 .collect(),
         })
         .collect()
@@ -193,7 +203,7 @@ mod tests {
         let create_statement =
             filter_create_table(Parser::parse_sql(&DIALECT, VALID_CREATE_QUERY).unwrap());
         let result = extract_table_info(&create_statement.first().unwrap().clone());
-        assert_eq!(result.name, "Persons")
+        assert_eq!(result.0, "Persons")
     }
 
     #[test]
@@ -208,8 +218,9 @@ mod tests {
     #[test]
     fn test_verify_table_doc_not_onboarded() {
         let mut mocked_table_info = create_sample_table_info();
-        mocked_table_info.name = "Not what I was expecting".to_string();
-        let Err(e) = verify_table_doc(&mocked_table_info) else {
+        mocked_table_info.0 = "Not what I was expecting".to_string();
+        let cache = HashMap::new();
+        let Err(e) = verify_table_doc(&mocked_table_info, &cache) else {
             panic!("Should fail here")
         };
         assert!(matches!(e, FailureResponse::DocumentationNotOnboarded(_)))
@@ -249,7 +260,6 @@ mod tests {
             .get_mut(0)
             .expect("sample column info should have at least one entry")
             .constraints
-            .get_or_insert_with(Vec::new)
             .push("NOT NULL".to_string());
 
         let Err(e) = verify_columns_doc(&mocked_column_info) else {
@@ -273,10 +283,8 @@ mod tests {
         let mocked_column_info = create_sample_column_info();
         let mocked_table_doc = create_sample_table_doc();
 
-        let Ok(response) = verify_columns_doc(&mocked_column_info) else {
-            panic!("Error should exists at this point")
-        };
-        assert_eq!(response, AcceptableResponse::Ok);
+        let response = verify_columns_doc(&mocked_column_info);
+        assert!(response.is_ok());
     }
 
     #[test]
@@ -288,35 +296,30 @@ mod tests {
             .get_mut(0)
             .expect("sample column info should have at least one entry")
             .constraints
-            .get_or_insert_with(Vec::new)
             .push("UNIQUE".to_string());
 
-        let Ok(response) = verify_columns_doc(&mocked_column_info) else {
-            panic!("Error should exists at this point")
-        };
-        assert_eq!(response, AcceptableResponse::Ok);
+        let response = verify_columns_doc(&mocked_column_info);
+        assert!(response.is_ok());
     }
 
     fn create_sample_table_info() -> TableInfo {
-        TableInfo {
-            name: "Person".to_string(),
-        }
+        TableInfo("Person".to_string())
     }
 
-    fn column_info_builder(name: &str, r#type: &str, constraints: Option<Vec<&str>>) -> ColumnInfo {
+    fn column_info_builder(name: &str, r#type: &str, constraints: Vec<&str>) -> ColumnInfo {
         ColumnInfo {
             name: name.to_string(),
             r#type: r#type.to_string(),
-            constraints: constraints.map(|c| c.into_iter().map(str::to_string).collect()),
+            constraints: constraints.into_iter().map(|c| c.to_string()).collect(),
         }
     }
     fn create_sample_column_info() -> Vec<ColumnInfo> {
         vec![
-            column_info_builder("PersonID", "int", Some(vec!["PRIMARY KEY"])),
-            column_info_builder("LastName", "varchar(255)", Some(vec!["NOT NULL"])),
-            column_info_builder("FirstName", "varchar(255)", None),
-            column_info_builder("Address", "varchar(255)", None),
-            column_info_builder("City", "varchar(255)", None),
+            column_info_builder("PersonID", "int", (vec!["PRIMARY KEY"])),
+            column_info_builder("LastName", "varchar(255)", (vec!["NOT NULL"])),
+            column_info_builder("FirstName", "varchar(255)", vec![]),
+            column_info_builder("Address", "varchar(255)", vec![]),
+            column_info_builder("City", "varchar(255)", vec![]),
         ]
     }
 
@@ -332,14 +335,14 @@ mod tests {
     fn column_doc_builder(
         name: &str,
         r#type: &str,
-        constraints: Option<Vec<&str>>,
+        constraints: Vec<&str>,
         description: &str,
         use_case: &str,
     ) -> ColumnDoc {
         ColumnDoc {
             name: name.to_string(),
             r#type: r#type.to_string(),
-            constraints: constraints.map(|c| c.into_iter().map(str::to_string).collect()),
+            constraints: constraints.iter().map(|s| s.to_string()).collect(),
             description: description.to_string(),
             use_case: use_case.to_string(),
         }
@@ -349,35 +352,35 @@ mod tests {
             column_doc_builder(
                 "PersonID",
                 "int",
-                Some(vec!["PRIMARY KEY"]),
+                vec!["PRIMARY KEY"],
                 "Id",
                 "table identifier",
             ),
             column_doc_builder(
                 "LastName",
                 "varchar(255)",
-                Some(vec!["NOT NULL"]),
+                vec!["NOT NULL"],
                 "Last name",
                 "person's surname",
             ),
             column_doc_builder(
                 "FirstName",
                 "varchar(255)",
-                None,
+                vec![],
                 "First name",
                 "person's given name",
             ),
             column_doc_builder(
                 "Address",
                 "varchar(255)",
-                None,
+                vec![],
                 "Address",
                 "person's residential address",
             ),
             column_doc_builder(
                 "City",
                 "varchar(255)",
-                None,
+                vec![],
                 "City",
                 "person's city of residence",
             ),

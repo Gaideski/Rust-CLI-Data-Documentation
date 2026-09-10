@@ -15,26 +15,20 @@ pub struct TableDoc {
 pub struct ColumnDoc {
     pub name: String,
     pub r#type: String,
-    pub constraints: Option<Vec<String>>,
+    #[serde(default)]
+    pub constraints: Vec<String>,
     pub description: String,
     pub use_case: String,
 }
 #[derive(Debug)]
-pub struct TableInfo {
-    pub name: String,
-}
+pub struct TableInfo (pub String);
 
-impl TableInfo {
-    pub fn new(name: String) -> TableInfo {
-        TableInfo { name }
-    }
-}
 
 #[derive(Debug)]
 pub struct ColumnInfo {
     pub name: String,
     pub r#type: String,
-    pub constraints: Option<Vec<String>>,
+    pub constraints: Vec<String>,
 }
 
 impl ColumnInfo {
@@ -54,8 +48,6 @@ impl ColumnInfo {
 
         let column_comparable_constraints: HashSet<_> = self
             .constraints
-            .as_deref()
-            .unwrap_or_default()
             .iter()
             .map(|s| s.to_uppercase())
             .filter(|c| is_comparable(c))
@@ -63,8 +55,6 @@ impl ColumnInfo {
 
         let doc_comparable_constraints: HashSet<_> = doc
             .constraints
-            .as_deref()
-            .unwrap_or_default()
             .iter()
             .map(|s| s.to_uppercase())
             .filter(|c| is_comparable(c))
@@ -140,7 +130,7 @@ mod tests {
         ColumnInfo {
             name: name.to_string(),
             r#type: type_.to_string(),
-            constraints: constraints.iter().map(|s| Some(s.to_string())).collect(),
+            constraints: constraints.iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -154,7 +144,7 @@ mod tests {
         ColumnDoc {
             name: name.to_string(),
             r#type: type_.to_string(),
-            constraints: constraints.iter().map(|s| Some(s.to_string())).collect(),
+            constraints: constraints.iter().map(|s| s.to_string()).collect(),
             description: description.to_string(),
             use_case: use_case.to_string(),
         }
