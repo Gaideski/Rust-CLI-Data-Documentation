@@ -1,14 +1,13 @@
-use crate::doc_persistence::{column_cache, table_cache};
+use crate::doc_persistence::table_cache;
 use crate::service_response::failures::FailureResponse;
 use crate::service_response::validation_report::ValidationReport;
-use crate::table_yaml_definition::{ColumnDoc, ColumnInfo, TableDoc, TableInfo};
+use crate::table_yaml_definition::{ColumnInfo, TableDoc, TableInfo};
 use sqlparser::ast::{CreateTable, ObjectNamePart, Statement};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 const DIALECT: GenericDialect = GenericDialect {};
 
@@ -38,8 +37,8 @@ pub fn validate(files: &[PathBuf]) -> Result<ValidationReport, Vec<FailureRespon
 fn validate_file(file: &PathBuf) -> Result<ValidationReport, Vec<FailureResponse>> {
     let contents = fs::read_to_string(file).map_err(|e| {
         vec![FailureResponse::IoError {
-            path: file.display().to_string(),
-            error: e.to_string(),
+            path: file.clone(),
+            source: e,
         }]
     })?;
     validate_single_file(&contents, file)
@@ -76,17 +75,15 @@ fn validate_single_file(
     }
 }
 
-fn extract_and_compare_info(statements: &Vec<CreateTable>) -> Result<(), Vec<FailureResponse>> {
+fn extract_and_compare_info(statements: &[CreateTable]) -> Result<(), Vec<FailureResponse>> {
     let mut errors: Vec<FailureResponse> = Vec::new();
     for stm in statements {
         let table = extract_table_info(&stm);
         let cache = table_cache().map_err(|e| vec![e]);
         match verify_table_doc(&table, cache?.as_ref()) {
-            Ok(_) => {
+            Ok(table_doc) => {
                 let columns = extract_columns_info(&stm);
-                if let Err(mut e) = verify_columns_doc(&columns) {
-                    errors.append(&mut e);
-                }
+                verify_columns_doc(&table_doc, &columns, &mut errors)
             }
             Err(e) => errors.push(e),
         }
@@ -102,48 +99,36 @@ fn verify_table_doc(
     query_table: &TableInfo,
     cache: &HashMap<String, TableDoc>,
 ) -> Result<TableDoc, FailureResponse> {
-    if let Ok(Some(doc)) = find_table_doc(query_table) {
-        Ok(doc)
-    } else {
-        Err(FailureResponse::DocumentationNotOnboarded(format!(
+    cache.get(&query_table.name).cloned().ok_or_else(|| {
+        FailureResponse::DocumentationNotOnboarded(format!(
             "Documentation not found for table: {}",
-            query_table.0
-        )))
-    }
+            query_table.name
+        ))
+    })
 }
 
-fn verify_columns_doc(columns: &[ColumnInfo]) -> Result<(), Vec<FailureResponse>> {
-    let mut errors = Vec::new();
+fn verify_columns_doc(
+    table_doc: &TableDoc,
+    columns: &[ColumnInfo],
+    errors: &mut Vec<FailureResponse>,
+) {
     for column in columns {
-        if let Ok(Some(doc)) = find_column_doc(&column) {
-            if !column.is_doc_equals(&doc) {
-                errors.push(FailureResponse::FieldMismatch {
-                    field_name: column.name.to_owned(),
-                    field_type: column.r#type.to_owned(),
-                    doc_type: doc.r#type.to_owned(),
-                    field_constraints: column.constraints.clone(),
-                    doc_constraints: doc.constraints.clone(),
-                })
-            }
-        } else {
-            errors.push(FailureResponse::MissingField(column.name.clone()))
+        match table_doc
+            .columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(&column.name))
+        {
+            None => errors.push(FailureResponse::MissingField(column.name.clone())),
+            Some(doc) if column.is_doc_equals(doc) => {}
+            Some(doc) => errors.push(FailureResponse::FieldMismatch {
+                field_name: column.name.to_owned(),
+                field_type: column.r#type.to_owned(),
+                doc_type: doc.r#type.to_owned(),
+                field_constraints: column.constraints.clone(),
+                doc_constraints: doc.constraints.clone(),
+            }),
         }
     }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors)
-    }
-}
-
-fn find_table_doc(table: &TableInfo) -> Result<Option<TableDoc>, FailureResponse> {
-    let cache = table_cache()?;
-    Ok(cache.get(&table.0).cloned())
-}
-
-fn find_column_doc(column: &ColumnInfo) -> Result<Option<Arc<ColumnDoc>>, FailureResponse> {
-    let cache = column_cache()?;
-    Ok(cache.get(&column.name).cloned())
 }
 
 fn filter_create_table(statements: Vec<Statement>) -> Vec<CreateTable> {
@@ -166,7 +151,7 @@ fn extract_table_info(table: &CreateTable) -> TableInfo {
             _ => None,
         })
         .unwrap_or_default();
-    TableInfo(table_name)
+    TableInfo { name: table_name }
 }
 
 fn extract_columns_info(table: &CreateTable) -> Vec<ColumnInfo> {
@@ -188,6 +173,9 @@ fn extract_columns_info(table: &CreateTable) -> Vec<ColumnInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::helper::from_str_collection_to_owned_string_vec;
+    use crate::table_yaml_definition::ColumnDoc;
+
     const VALID_CREATE_QUERY: &str = r#"
     CREATE TABLE Persons (
       PersonID int PRIMARY KEY,
@@ -203,7 +191,7 @@ mod tests {
         let create_statement =
             filter_create_table(Parser::parse_sql(&DIALECT, VALID_CREATE_QUERY).unwrap());
         let result = extract_table_info(&create_statement.first().unwrap().clone());
-        assert_eq!(result.0, "Persons")
+        assert_eq!(result.name, "Persons")
     }
 
     #[test]
@@ -218,7 +206,7 @@ mod tests {
     #[test]
     fn test_verify_table_doc_not_onboarded() {
         let mut mocked_table_info = create_sample_table_info();
-        mocked_table_info.0 = "Not what I was expecting".to_string();
+        mocked_table_info.name = "Not what I was expecting".to_string();
         let cache = HashMap::new();
         let Err(e) = verify_table_doc(&mocked_table_info, &cache) else {
             panic!("Should fail here")
@@ -239,35 +227,34 @@ mod tests {
     fn test_verify_column_doc_missing() {
         let mut mocked_column_info = create_sample_column_info();
         let mocked_table_doc = create_sample_table_doc();
-
+        let mut err = Vec::new();
         mocked_column_info
             .get_mut(0)
             .expect("sample column info should have at least one entry")
             .name = "Not what I was expecting".to_string();
-        let Err(e) = verify_columns_doc(&mocked_column_info) else {
-            panic!("Error should exists at this point")
-        };
-        assert_eq!(e.len(), 1);
-        assert!(matches!(e[0], FailureResponse::MissingField(_)));
+        verify_columns_doc(&mocked_table_doc, &mocked_column_info, &mut err);
+        assert_eq!(err.len(), 1);
+        assert!(matches!(
+            err.get(0).unwrap(),
+            FailureResponse::MissingField(_)
+        ));
     }
 
     #[test]
     fn test_verify_column_doc_fails_details_unmatched() {
         let mut mocked_column_info = create_sample_column_info();
         let mocked_table_doc = create_sample_table_doc();
-
+        let mut err = vec![];
         mocked_column_info
             .get_mut(0)
             .expect("sample column info should have at least one entry")
             .constraints
             .push("NOT NULL".to_string());
 
-        let Err(e) = verify_columns_doc(&mocked_column_info) else {
-            panic!("Error should exists at this point")
-        };
-        assert_eq!(e.len(), 1);
+        verify_columns_doc(&mocked_table_doc, &mocked_column_info, &mut err);
+        assert_eq!(err.len(), 1);
         assert!(matches!(
-            e[0],
+            err.get(0).unwrap(),
             FailureResponse::FieldMismatch {
                 field_name: _,
                 field_type: _,
@@ -282,15 +269,16 @@ mod tests {
     fn test_verify_column_doc_success() {
         let mocked_column_info = create_sample_column_info();
         let mocked_table_doc = create_sample_table_doc();
-
-        let response = verify_columns_doc(&mocked_column_info);
-        assert!(response.is_ok());
+        let mut err = vec![];
+        verify_columns_doc(&mocked_table_doc, &mocked_column_info, &mut err);
+        assert!(err.is_empty());
     }
 
     #[test]
     fn test_verify_column_doc_success_with_non_comparable_constraints() {
         let mut mocked_column_info = create_sample_column_info();
         let mocked_table_doc = create_sample_table_doc();
+        let mut err = vec![];
 
         mocked_column_info
             .get_mut(0)
@@ -298,28 +286,30 @@ mod tests {
             .constraints
             .push("UNIQUE".to_string());
 
-        let response = verify_columns_doc(&mocked_column_info);
-        assert!(response.is_ok());
+        verify_columns_doc(&mocked_table_doc, &mocked_column_info, &mut err);
+        assert!(err.is_empty());
     }
 
     fn create_sample_table_info() -> TableInfo {
-        TableInfo("Person".to_string())
+        TableInfo {
+            name: "Person".to_string(),
+        }
     }
 
-    fn column_info_builder(name: &str, r#type: &str, constraints: Vec<&str>) -> ColumnInfo {
+    fn column_info_builder(name: &str, r#type: &str, constraints: &[&str]) -> ColumnInfo {
         ColumnInfo {
             name: name.to_string(),
             r#type: r#type.to_string(),
-            constraints: constraints.into_iter().map(|c| c.to_string()).collect(),
+            constraints: from_str_collection_to_owned_string_vec(constraints),
         }
     }
     fn create_sample_column_info() -> Vec<ColumnInfo> {
         vec![
-            column_info_builder("PersonID", "int", (vec!["PRIMARY KEY"])),
-            column_info_builder("LastName", "varchar(255)", (vec!["NOT NULL"])),
-            column_info_builder("FirstName", "varchar(255)", vec![]),
-            column_info_builder("Address", "varchar(255)", vec![]),
-            column_info_builder("City", "varchar(255)", vec![]),
+            column_info_builder("PersonID", "int", ["PRIMARY KEY"].as_ref()),
+            column_info_builder("LastName", "varchar(255)", ["NOT NULL"].as_ref()),
+            column_info_builder("FirstName", "varchar(255)", [].as_ref()),
+            column_info_builder("Address", "varchar(255)", [].as_ref()),
+            column_info_builder("City", "varchar(255)", [].as_ref()),
         ]
     }
 
@@ -335,14 +325,14 @@ mod tests {
     fn column_doc_builder(
         name: &str,
         r#type: &str,
-        constraints: Vec<&str>,
+        constraints: &[&str],
         description: &str,
         use_case: &str,
     ) -> ColumnDoc {
         ColumnDoc {
             name: name.to_string(),
             r#type: r#type.to_string(),
-            constraints: constraints.iter().map(|s| s.to_string()).collect(),
+            constraints: from_str_collection_to_owned_string_vec(constraints),
             description: description.to_string(),
             use_case: use_case.to_string(),
         }
@@ -352,35 +342,35 @@ mod tests {
             column_doc_builder(
                 "PersonID",
                 "int",
-                vec!["PRIMARY KEY"],
+                ["PRIMARY KEY"].as_ref(),
                 "Id",
                 "table identifier",
             ),
             column_doc_builder(
                 "LastName",
                 "varchar(255)",
-                vec!["NOT NULL"],
+                ["NOT NULL"].as_ref(),
                 "Last name",
                 "person's surname",
             ),
             column_doc_builder(
                 "FirstName",
                 "varchar(255)",
-                vec![],
+                [].as_ref(),
                 "First name",
                 "person's given name",
             ),
             column_doc_builder(
                 "Address",
                 "varchar(255)",
-                vec![],
+                [].as_ref(),
                 "Address",
                 "person's residential address",
             ),
             column_doc_builder(
                 "City",
                 "varchar(255)",
-                vec![],
+                [].as_ref(),
                 "City",
                 "person's city of residence",
             ),

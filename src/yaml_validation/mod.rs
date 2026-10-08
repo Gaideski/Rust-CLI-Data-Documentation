@@ -30,46 +30,42 @@ pub fn validate_yml_files(
 }
 
 fn persist_docs(docs: &[TableDoc]) -> Result<(), FailureResponse> {
-    Ok(save_all(&docs).map_err(|e| FailureResponse::IoError {
-        error: e.to_string(),
-        path: "unknown_path".to_string(),
-    }))?
+    save_all(&docs).map_err(|e| FailureResponse::SerializationError {
+        source: e,
+        path: PathBuf::new(),
+    })
 }
 
 fn validate_single_file(path: &PathBuf) -> Result<TableDoc, FailureResponse> {
     let content = read_file(path)?;
-    match yaml_serde::from_str::<TableDoc>(&content) {
-        Ok(table_doc) => match table_doc.validate() {
-            Ok(_) => Ok(table_doc),
-            Err(e) => Err({
-                FailureResponse::Malformed(e.iter().fold(String::new(), |s1, s2| s1 + ", " + s2))
-            }),
-        },
-        Err(e) => Err(FailureResponse::MissingField(format!(
-            "File: {}, failed at {e}.",
-            path.display()
-        ))),
-    }
+    let doc: TableDoc = yaml_serde::from_str(&content).map_err(|e| {
+        FailureResponse::Malformed(format!("File:{}, failed at {e}", path.display()))
+    })?;
+    doc.validate().map_err(|problems| {
+        FailureResponse::MissingField(format!("{}: {}", path.display(), problems.join(", ")))
+    })?;
+    Ok(doc)
 }
 
 fn read_file(file_path: &PathBuf) -> Result<String, FailureResponse> {
     match read_to_string(file_path) {
         Ok(c) => Ok(c),
         Err(e) => Err(FailureResponse::IoError {
-            path: file_path.display().to_string(),
-            error: e.to_string(),
+            path: file_path.clone(),
+            source: e,
         }),
     }
 }
 
 #[cfg(test)]
 mod test {
+    use crate::service_response::failures::FailureResponse;
     use crate::service_response::validation_report::ValidationReport;
     use crate::yaml_validation::{read_file, validate_yml_files};
-    use std::env;
-    use std::fs::{create_dir_all, remove_dir_all, write};
-    use std::path::PathBuf;
+    use std::fs::{create_dir_all, write};
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tempfile::TempDir;
 
     const VALID_YAML: &str = r#"
     name: "users"
@@ -101,46 +97,41 @@ mod test {
 
     #[test]
     fn test_read_file_successful() {
-        let temp_dir = "cli-yaml-read-validation".to_string();
-        let dir = env::temp_dir().join(temp_dir);
+        let temp_dir = TempDir::new().unwrap();
         let file_path =
-            create_file_with_content(&dir, VALID_YAML).expect("Failed to create valid test file");
+            create_file_with_content(&temp_dir.path(), VALID_YAML).expect("Failed to create valid test file");
         assert_eq!(VALID_YAML.trim(), read_file(&file_path).unwrap().trim());
-        remove_dir_all(&dir).expect("Failed to remove test data at temp dir");
     }
 
     #[test]
-    #[should_panic]
     fn test_read_file_panics() {
         let temp_dir = PathBuf::from("cli-yaml-read-validation");
-        read_file(&temp_dir).unwrap();
+        let Err(FailureResponse::IoError { .. }) = read_file(&temp_dir) else {
+            panic!("expected IoError");
+        };
     }
 
     #[test]
     fn test_validate_yaml_successful() {
-        let temp_dir = "cli-yaml-read-validation".to_string();
-        let dir = env::temp_dir().join(temp_dir);
+        let dir = TempDir::new().unwrap();
         let file_path =
-            create_file_with_content(&dir, VALID_YAML).expect("Failed to create valid test file");
+            create_file_with_content(&dir.path(), VALID_YAML).expect("Failed to create valid test file");
         assert_eq!(
             ValidationReport::new(),
             validate_yml_files(&vec![file_path]).unwrap()
         );
-        remove_dir_all(&dir).expect("Failed to remove test data at temp dir");
     }
     #[test]
     fn test_validate_yaml_invalid_fails() {
-        let temp_dir = "cli-yaml-read-validation".to_string();
-        let dir = env::temp_dir().join(temp_dir);
+        let dir = TempDir::new().unwrap();
         let file_path =
-            create_file_with_content(&dir, INVALID_YAML).expect("Failed to create valid test file");
+            create_file_with_content(&dir.path(), INVALID_YAML).expect("Failed to create valid test file");
         let response = validate_yml_files(&vec![file_path]);
         assert!(response.is_err());
-        remove_dir_all(&dir).expect("Failed to remove test data at temp dir");
     }
 
     fn create_file_with_content(
-        dir: &PathBuf,
+        dir: &Path,
         contents: &str,
     ) -> Result<PathBuf, Box<dyn std::error::Error>> {
         create_dir_all(&dir)?;

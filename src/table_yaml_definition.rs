@@ -1,7 +1,8 @@
+use crate::helper::from_str_collection_to_owned_string_vec;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-#[derive(Debug, Serialize, Deserialize, PartialOrd, PartialEq, Clone)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct TableDoc {
     pub name: String,
@@ -10,7 +11,7 @@ pub struct TableDoc {
     pub columns: Vec<ColumnDoc>,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialOrd, PartialEq, Clone)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ColumnDoc {
     pub name: String,
@@ -21,8 +22,9 @@ pub struct ColumnDoc {
     pub use_case: String,
 }
 #[derive(Debug)]
-pub struct TableInfo (pub String);
-
+pub struct TableInfo {
+    pub name: String,
+}
 
 #[derive(Debug)]
 pub struct ColumnInfo {
@@ -113,38 +115,40 @@ impl ColumnDoc {
         }
     }
 }
+const MIN_FIELD_LEN: usize = 2;
 
-pub fn check_empty(field: &str, current_value: &str, problems: &mut Vec<String>) {
-    if current_value.trim().is_empty() || current_value.trim().len() < 2 {
+fn check_empty(field: &str, current_value: &str, problems: &mut Vec<String>) {
+    if current_value.trim().len() < MIN_FIELD_LEN {
         problems.push(format!(
             "Field: {} is empty or does not contain enough characters!",
             field
         ))
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn col_info(name: &str, type_: &str, constraints: Vec<&str>) -> ColumnInfo {
+    fn col_info(name: &str, type_: &str, constraints: &[&str]) -> ColumnInfo {
         ColumnInfo {
             name: name.to_string(),
             r#type: type_.to_string(),
-            constraints: constraints.iter().map(|s| s.to_string()).collect(),
+            constraints: from_str_collection_to_owned_string_vec(constraints),
         }
     }
 
     fn col_doc(
         name: &str,
         type_: &str,
-        constraints: Vec<&str>,
+        constraints: &[&str],
         description: &str,
         use_case: &str,
     ) -> ColumnDoc {
         ColumnDoc {
             name: name.to_string(),
             r#type: type_.to_string(),
-            constraints: constraints.iter().map(|s| s.to_string()).collect(),
+            constraints: from_str_collection_to_owned_string_vec(constraints),
             description: description.to_string(),
             use_case: use_case.to_string(),
         }
@@ -154,15 +158,15 @@ mod tests {
 
     #[test]
     fn exact_match() {
-        let col = col_info("id", "INTEGER", vec!["NOT NULL"]);
-        let doc = col_doc("id", "INTEGER", vec!["NOT NULL"], "", "");
+        let col = col_info("id", "INTEGER", ["NOT NULL"].as_ref());
+        let doc = col_doc("id", "INTEGER", ["NOT NULL"].as_ref(), "", "");
         assert!(col.is_doc_equals(&doc));
     }
 
     #[test]
     fn case_insensitive_name_and_type() {
-        let col = col_info("UserName", "VarChar", vec!["NOT NULL"]);
-        let doc = col_doc("username", "varchar", vec!["NOT NULL"], "", "");
+        let col = col_info("UserName", "VarChar", ["NOT NULL"].as_ref());
+        let doc = col_doc("username", "varchar", ["NOT NULL"].as_ref(), "", "");
         assert!(col.is_doc_equals(&doc));
     }
 
@@ -170,15 +174,15 @@ mod tests {
 
     #[test]
     fn check_with_expression_filtered() {
-        let col = col_info("age", "INTEGER", vec!["CHECK (age > 0)", "NOT NULL"]);
-        let doc = col_doc("age", "INTEGER", vec!["NOT NULL"], "", "");
+        let col = col_info("age", "INTEGER", ["CHECK (age > 0)", "NOT NULL"].as_ref());
+        let doc = col_doc("age", "INTEGER", ["NOT NULL"].as_ref(), "", "");
         assert!(col.is_doc_equals(&doc));
     }
 
     #[test]
     fn primary_key_with_column_name_filtered() {
-        let col = col_info("id", "INTEGER", vec!["PRIMARY KEY (id)", "NOT NULL"]);
-        let doc = col_doc("id", "INTEGER", vec!["NOT NULL"], "", "");
+        let col = col_info("id", "INTEGER", ["PRIMARY KEY (id)", "NOT NULL"].as_ref());
+        let doc = col_doc("id", "INTEGER", ["NOT NULL"].as_ref(), "", "");
         assert!(col.is_doc_equals(&doc));
     }
 
@@ -187,16 +191,20 @@ mod tests {
         let col = col_info(
             "user_id",
             "INTEGER",
-            vec!["FOREIGN KEY REFERENCES users(id)", "NOT NULL"],
+            ["FOREIGN KEY REFERENCES users(id)", "NOT NULL"].as_ref(),
         );
-        let doc = col_doc("user_id", "INTEGER", vec!["NOT NULL"], "", "");
+        let doc = col_doc("user_id", "INTEGER", ["NOT NULL"].as_ref(), "", "");
         assert!(col.is_doc_equals(&doc));
     }
 
     #[test]
     fn unique_with_columns_filtered() {
-        let col = col_info("email", "TEXT", vec!["UNIQUE (email, domain)", "NOT NULL"]);
-        let doc = col_doc("email", "TEXT", vec!["NOT NULL"], "", "");
+        let col = col_info(
+            "email",
+            "TEXT",
+            ["UNIQUE (email, domain)", "NOT NULL"].as_ref(),
+        );
+        let doc = col_doc("email", "TEXT", ["NOT NULL"].as_ref(), "", "");
         assert!(col.is_doc_equals(&doc));
     }
 
@@ -205,9 +213,9 @@ mod tests {
         let col = col_info(
             "period",
             "TSTZRANGE",
-            vec!["EXCLUSION USING gist (period WITH &&)", "NOT NULL"],
+            ["EXCLUSION USING gist (period WITH &&)", "NOT NULL"].as_ref(),
         );
-        let doc = col_doc("period", "TSTZRANGE", vec!["NOT NULL"], "", "");
+        let doc = col_doc("period", "TSTZRANGE", ["NOT NULL"].as_ref(), "", "");
         assert!(col.is_doc_equals(&doc));
     }
 
@@ -215,15 +223,15 @@ mod tests {
 
     #[test]
     fn lowercase_check_filtered() {
-        let col = col_info("age", "INTEGER", vec!["check (age > 0)"]);
-        let doc = col_doc("age", "INTEGER", vec![], "", "");
+        let col = col_info("age", "INTEGER", ["check (age > 0)"].as_ref());
+        let doc = col_doc("age", "INTEGER", [].as_ref(), "", "");
         assert!(col.is_doc_equals(&doc));
     }
 
     #[test]
     fn mixed_case_primary_key_filtered() {
-        let col = col_info("id", "INTEGER", vec!["Primary Key"]);
-        let doc = col_doc("id", "INTEGER", vec![], "", "");
+        let col = col_info("id", "INTEGER", ["Primary Key"].as_ref());
+        let doc = col_doc("id", "INTEGER", [].as_ref(), "", "");
         assert!(col.is_doc_equals(&doc));
     }
 
@@ -231,15 +239,21 @@ mod tests {
 
     #[test]
     fn different_non_comparable_both_filtered() {
-        let col = col_info("id", "INTEGER", vec!["PRIMARY KEY", "NOT NULL"]);
-        let doc = col_doc("id", "INTEGER", vec!["UNIQUE", "NOT NULL"], "", "");
+        let col = col_info("id", "INTEGER", ["PRIMARY KEY", "NOT NULL"].as_ref());
+        let doc = col_doc("id", "INTEGER", ["UNIQUE", "NOT NULL"].as_ref(), "", "");
         assert!(col.is_doc_equals(&doc));
     }
 
     #[test]
     fn all_non_comparable_only() {
-        let col = col_info("id", "INTEGER", vec!["PRIMARY KEY", "CHECK (x > 0)"]);
-        let doc = col_doc("id", "INTEGER", vec!["FOREIGN KEY", "EXCLUSION"], "", "");
+        let col = col_info("id", "INTEGER", ["PRIMARY KEY", "CHECK (x > 0)"].as_ref());
+        let doc = col_doc(
+            "id",
+            "INTEGER",
+            ["FOREIGN KEY", "EXCLUSION"].as_ref(),
+            "",
+            "",
+        );
         assert!(col.is_doc_equals(&doc));
     }
 
@@ -247,29 +261,29 @@ mod tests {
 
     #[test]
     fn comparable_missing_in_doc() {
-        let col = col_info("id", "INTEGER", vec!["NOT NULL", "DEFAULT 0"]);
-        let doc = col_doc("id", "INTEGER", vec!["NOT NULL"], "", "");
+        let col = col_info("id", "INTEGER", ["NOT NULL", "DEFAULT 0"].as_ref());
+        let doc = col_doc("id", "INTEGER", ["NOT NULL"].as_ref(), "", "");
         assert!(!col.is_doc_equals(&doc));
     }
 
     #[test]
     fn comparable_extra_in_doc() {
-        let col = col_info("id", "INTEGER", vec!["NOT NULL"]);
-        let doc = col_doc("id", "INTEGER", vec!["NOT NULL", "DEFAULT 0"], "", "");
+        let col = col_info("id", "INTEGER", ["NOT NULL"].as_ref());
+        let doc = col_doc("id", "INTEGER", ["NOT NULL", "DEFAULT 0"].as_ref(), "", "");
         assert!(!col.is_doc_equals(&doc));
     }
 
     #[test]
     fn comparable_different_values() {
-        let col = col_info("id", "INTEGER", vec!["DEFAULT 0"]);
-        let doc = col_doc("id", "INTEGER", vec!["DEFAULT 1"], "", "");
+        let col = col_info("id", "INTEGER", ["DEFAULT 0"].as_ref());
+        let doc = col_doc("id", "INTEGER", ["DEFAULT 1"].as_ref(), "", "");
         assert!(!col.is_doc_equals(&doc));
     }
 
     #[test]
     fn comparable_order_independent() {
-        let col = col_info("id", "INTEGER", vec!["NOT NULL", "DEFAULT 0"]);
-        let doc = col_doc("id", "INTEGER", vec!["DEFAULT 0", "NOT NULL"], "", "");
+        let col = col_info("id", "INTEGER", ["NOT NULL", "DEFAULT 0"].as_ref());
+        let doc = col_doc("id", "INTEGER", ["DEFAULT 0", "NOT NULL"].as_ref(), "", "");
         assert!(col.is_doc_equals(&doc));
     }
 
@@ -277,15 +291,15 @@ mod tests {
 
     #[test]
     fn name_mismatch() {
-        let col = col_info("id", "INTEGER", vec![]);
-        let doc = col_doc("other_id", "INTEGER", vec![], "", "");
+        let col = col_info("id", "INTEGER", [].as_ref());
+        let doc = col_doc("other_id", "INTEGER", [].as_ref(), "", "");
         assert!(!col.is_doc_equals(&doc));
     }
 
     #[test]
     fn type_mismatch() {
-        let col = col_info("id", "INTEGER", vec![]);
-        let doc = col_doc("id", "TEXT", vec![], "", "");
+        let col = col_info("id", "INTEGER", [].as_ref());
+        let doc = col_doc("id", "TEXT", [].as_ref(), "", "");
         assert!(!col.is_doc_equals(&doc));
     }
 
@@ -293,11 +307,11 @@ mod tests {
 
     #[test]
     fn description_and_use_case_ignored() {
-        let col = col_info("id", "INTEGER", vec!["NOT NULL"]);
+        let col = col_info("id", "INTEGER", ["NOT NULL"].as_ref());
         let doc = col_doc(
             "id",
             "INTEGER",
-            vec!["NOT NULL"],
+            ["NOT NULL"].as_ref(),
             "any desc",
             "any use case",
         );
